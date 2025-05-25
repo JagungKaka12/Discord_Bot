@@ -5,7 +5,7 @@ import io
 import time
 import logging
 from dotenv import load_dotenv
-from discord import Client, Intents, Interaction, File, app_commands, Attachment
+from discord import Client, Intents, Interaction, File, app_commands, Attachment, ButtonStyle, ui
 from discord.ext import commands
 import google.genai as genai
 import google.genai.types as types
@@ -13,16 +13,16 @@ import requests
 from bs4 import BeautifulSoup
 import pathlib
 from PIL import Image
-import aiohttp  # UBAH: Menggunakan aiohttp untuk async HTTP requests
+import aiohttp
 from typing import Optional, Dict, List, Tuple, Union
 
-# UBAH: Setup logging untuk debugging yang lebih baik
+# Setup logging untuk debugging yang lebih baik
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# UBAH: Validasi environment variables
+# Validasi environment variables
 required_env_vars = ['GEMINI_API_KEY', 'DISCORD_TOKEN', 'GOOGLE_API_KEY', 'GOOGLE_CSE_ID']
 missing_vars = [var for var in required_env_vars if not os.getenv(var)]
 if missing_vars:
@@ -43,14 +43,16 @@ Jawab dengan bahasa Indonesia. Pastikan output rapi dan mudah dibaca di Discord 
 - Batasi pesan agar tidak melebihi 2000 karakter.
 """
 
-# UBAH: Menggunakan class untuk mengelola state dengan lebih baik
 class BotState:
     def __init__(self):
         self.conversation_history: Dict[str, any] = {}
         self.image_history: Dict[str, bytes] = {}
         self.command_cooldowns: Dict[str, float] = {}
         self.channel_activity: Dict[str, bool] = {}
-        self.response_mode: Dict[str, str] = {}
+        # TAMBAH: Menyimpan waktu aktivitas terakhir per channel untuk melacak ketidakaktifan
+        self.last_activity: Dict[str, float] = {}
+        # TAMBAH: Menyimpan pesan tombol terakhir yang dikirim per channel
+        self.last_button_message: Dict[str, any] = {}
         
     def cleanup_old_data(self):
         """Membersihkan data lama untuk menghemat memori"""
@@ -64,8 +66,9 @@ class BotState:
 bot_state = BotState()
 
 MAX_HISTORY = 10
-COOLDOWN_TIME = 30  # UBAH: Dalam detik, bukan milliseconds
-MAX_FILE_SIZE = 25 * 1024 * 1024  # UBAH: 25MB limit untuk file uploads
+COOLDOWN_TIME = 30  # Dalam detik
+MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB limit untuk file uploads
+INACTIVITY_TIMEOUT = 30  # Dalam detik, waktu untuk mendeteksi ketidakaktifan
 
 SUPPORTED_MIME_TYPES = {
     'image/jpeg': 'image',
@@ -80,7 +83,6 @@ SUPPORTED_MIME_TYPES = {
     'image/jpg': 'image'
 }
 
-# UBAH: Session HTTP yang dapat digunakan kembali
 http_session: Optional[aiohttp.ClientSession] = None
 
 async def get_http_session() -> aiohttp.ClientSession:
@@ -92,7 +94,6 @@ async def get_http_session() -> aiohttp.ClientSession:
     return http_session
 
 async def fetch_web_content(url: str) -> str:
-    """UBAH: Menggunakan aiohttp dan error handling yang lebih baik"""
     try:
         session = await get_http_session()
         headers = {'User-Agent': 'Mozilla/5.0 (compatible; DiscordBot/1.0)'}
@@ -103,12 +104,11 @@ async def fetch_web_content(url: str) -> str:
             
             html = await response.text()
             
-        # UBAH: Parsing HTML tanpa blocking
         soup = BeautifulSoup(html, 'html.parser')
         content = ""
         for elem in soup.select('p, h1, h2, h3, article, main'):
             text = elem.get_text().strip()
-            if text:  # UBAH: Hanya tambahkan jika ada teks
+            if text:
                 content += text + '\n'
                 
         return content[:5000] if content else "Konten tidak ditemukan pada halaman tersebut."
@@ -121,7 +121,6 @@ async def fetch_web_content(url: str) -> str:
         return f"**Error Scraping**\nGagal mengambil konten dari {url}: {str(error)}"
 
 async def translate_text(text: str, target_language: str = 'en') -> str:
-    """UBAH: Menggunakan aiohttp dan error handling yang lebih baik"""
     try:
         session = await get_http_session()
         url = f"https://translation.googleapis.com/language/translate/v2?key={GOOGLE_API_KEY}"
@@ -145,7 +144,6 @@ async def translate_text(text: str, target_language: str = 'en') -> str:
         return text
 
 async def google_search(query: str) -> str:
-    """UBAH: Menggunakan aiohttp dan error handling yang lebih baik"""
     try:
         session = await get_http_session()
         url = f"https://www.googleapis.com/customsearch/v1?key={GOOGLE_API_KEY}&cx={GOOGLE_CSE_ID}&q={query}&num=5&lr=lang_id&gl=id"
@@ -164,8 +162,8 @@ async def google_search(query: str) -> str:
 
         search_results = "**Hasil Pencarian dari Google**\n\n"
         for index, item in enumerate(data['items']):
-            title = item.get('title', 'No Title')[:100]  # UBAH: Batasi panjang title
-            snippet = item.get('snippet', 'No description')[:200]  # UBAH: Batasi panjang snippet
+            title = item.get('title', 'No Title')[:100]
+            snippet = item.get('snippet', 'No description')[:200]
             search_results += f"- **{index + 1}. {title}**\n"
             search_results += f"  {snippet}\n"
             search_results += f"  Sumber: [Klik di sini]({item['link']})\n\n"
@@ -178,7 +176,6 @@ async def google_search(query: str) -> str:
         return "**Error**\nTerjadi kesalahan saat melakukan pencarian Google."
 
 def extract_youtube_url(text: str) -> Optional[str]:
-    """UBAH: Menambahkan type hints dan pattern yang lebih robust"""
     import re
     youtube_patterns = [
         r'(https?://(?:www\.)?youtube\.com/watch\?v=[\w-]+)',
@@ -195,7 +192,6 @@ def extract_youtube_url(text: str) -> Optional[str]:
 async def generate_response(channel_id: str, prompt: str, media_data: Optional[Dict] = None, 
                           search_query: Optional[str] = None, use_thinking: bool = False, 
                           youtube_url: Optional[str] = None) -> str:
-    """UBAH: Error handling yang lebih baik dan timeout protection"""
     try:
         model_name = "gemini-2.0-flash-thinking-exp" if use_thinking else "gemini-2.0-flash"
         
@@ -220,7 +216,6 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
             try:
                 if media_data['mime_type'] == 'application/pdf':
                     pdf_buffer = base64.b64decode(media_data['base64'])
-                    # UBAH: Validasi ukuran file PDF
                     if len(pdf_buffer) > MAX_FILE_SIZE:
                         return "**Error**\nFile PDF terlalu besar. Maksimal 25MB."
                     pdf_file = client.files.upload(file=io.BytesIO(pdf_buffer), config=dict(mime_type='application/pdf'))
@@ -242,14 +237,13 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
                 file_data=types.FileData(file_uri=youtube_url)
             ))
 
-        # UBAH: Menggunakan asyncio.wait_for untuk timeout protection
         try:
             response = await asyncio.wait_for(
                 asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: chat.send_message(contents)
                 ),
-                timeout=60.0  # 60 detik timeout
+                timeout=60.0
             )
         except asyncio.TimeoutError:
             return "**Error**\nTimeout: Permintaan memakan waktu terlalu lama."
@@ -266,7 +260,6 @@ async def generate_response(channel_id: str, prompt: str, media_data: Optional[D
         return f"**Error**\nTerjadi kesalahan saat menghasilkan respons: {str(error)}"
 
 async def enrich_prompt(prompt: str, use_english: bool = False) -> str:
-    """UBAH: Error handling dan timeout yang lebih baik"""
     try:
         model_name = "gemini-2.0-flash"
         language_instruction = "Jawab dengan bahasa Indonesia." if not use_english else "Answer in English."
@@ -298,7 +291,6 @@ async def enrich_prompt(prompt: str, use_english: bool = False) -> str:
         return prompt
 
 async def generate_image(channel_id: str, prompt: str, use_english: bool = False) -> Tuple[Optional[io.BytesIO], str]:
-    """UBAH: Error handling dan timeout yang lebih baik"""
     try:
         enriched_prompt = await enrich_prompt(prompt, use_english)
         logger.info(f"Enriched Prompt: {enriched_prompt}")
@@ -317,7 +309,7 @@ async def generate_image(channel_id: str, prompt: str, use_english: bool = False
                     )
                 )
             ),
-            timeout=120.0  # 2 menit timeout untuk image generation
+            timeout=120.0
         )
         
         image_data = None
@@ -357,15 +349,13 @@ async def generate_image(channel_id: str, prompt: str, use_english: bool = False
         return None, error_text
 
 async def edit_image(channel_id: str, prompt: str, image_data: bytes, use_english: bool = False) -> Tuple[Optional[io.BytesIO], str]:
-    """UBAH: Error handling dan timeout yang lebih baik"""
     try:
         model_name = "gemini-2.0-flash-exp"
         
-        # UBAH: Validasi image data
         try:
             image_buffer = io.BytesIO(image_data)
             pil_image = Image.open(image_buffer)
-            pil_image.verify()  # Validasi gambar
+            pil_image.verify()
         except Exception as e:
             error_text = "**Error**\nGambar tidak valid atau rusak."
             if use_english:
@@ -424,7 +414,6 @@ async def edit_image(channel_id: str, prompt: str, image_data: bytes, use_englis
         return None, error_text
 
 def split_text(text: str, max_length: int = 1900) -> List[str]:
-    """UBAH: Algoritma splitting yang lebih efisien"""
     if len(text) <= max_length:
         return [text]
         
@@ -437,7 +426,6 @@ def split_text(text: str, max_length: int = 1900) -> List[str]:
     for line in lines:
         line_with_newline = line + '\n' if line != lines[-1] else line
         
-        # Handle code blocks
         if line.strip().startswith('```'):
             if not in_code_block:
                 current_language = line.strip().replace('```', '')
@@ -454,18 +442,15 @@ def split_text(text: str, max_length: int = 1900) -> List[str]:
                 current_chunk += line_with_newline
             continue
 
-        # Handle long lines
         if len(line) > max_length:
             if current_chunk:
                 chunks.append(current_chunk.strip())
                 current_chunk = ''
             
-            # Split long line into parts
             for i in range(0, len(line), max_length):
                 part = line[i:i+max_length]
                 chunks.append(part)
         else:
-            # Normal line handling
             if len(current_chunk) + len(line_with_newline) > max_length:
                 if in_code_block:
                     current_chunk += '\n```'
@@ -480,9 +465,8 @@ def split_text(text: str, max_length: int = 1900) -> List[str]:
             current_chunk += '\n```'
         chunks.append(current_chunk.strip())
 
-    return [chunk for chunk in chunks if chunk.strip()]  # UBAH: Hapus chunk kosong
+    return [chunk for chunk in chunks if chunk.strip()]
 
-# UBAH: Helper function untuk cooldown management
 def check_cooldown(user_id: str, command: str) -> Tuple[bool, float]:
     """Check if user is on cooldown for a command"""
     cooldown_key = f"{user_id}-{command}"
@@ -496,6 +480,42 @@ def check_cooldown(user_id: str, command: str) -> Tuple[bool, float]:
     bot_state.command_cooldowns[cooldown_key] = current_time + COOLDOWN_TIME
     return False, 0
 
+# TAMBAH: Membuat kelas untuk tombol interaktif
+class InteractionButtons(ui.View):
+    def __init__(self, channel_id: str):
+        super().__init__(timeout=None)
+        self.channel_id = channel_id
+
+    @ui.button(label="New", style=ButtonStyle.green, custom_id="new_conversation")
+    async def new_button(self, interaction: Interaction, button: ui.Button):
+        """Menangani tombol 'New' untuk memulai percakapan baru"""
+        channel_id = str(interaction.channel_id)
+        if channel_id in bot_state.conversation_history:
+            bot_state.conversation_history.pop(channel_id)
+        bot_state.channel_activity[channel_id] = True
+        bot_state.last_activity[channel_id] = time.time()
+        if channel_id in bot_state.last_button_message:
+            try:
+                await bot_state.last_button_message[channel_id].delete()
+                del bot_state.last_button_message[channel_id]
+            except Exception as e:
+                logger.error(f"Error deleting button message: {e}")
+        await interaction.response.send_message("✅ Percakapan baru dimulai! Kirim pesan untuk melanjutkan.", ephemeral=True)
+
+    @ui.button(label="Continue", style=ButtonStyle.blurple, custom_id="continue_conversation")
+    async def continue_button(self, interaction: Interaction, button: ui.Button):
+        """Menangani tombol 'Continue' untuk melanjutkan percakapan"""
+        channel_id = str(interaction.channel_id)
+        bot_state.channel_activity[channel_id] = True
+        bot_state.last_activity[channel_id] = time.time()
+        if channel_id in bot_state.last_button_message:
+            try:
+                await bot_state.last_button_message[channel_id].delete()
+                del bot_state.last_button_message[channel_id]
+            except Exception as e:
+                logger.error(f"Error deleting button message: {e}")
+        await interaction.response.send_message("✅ Melanjutkan percakapan! Kirim pesan untuk melanjutkan.", ephemeral=True)
+
 intents = Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
@@ -506,24 +526,40 @@ async def on_ready():
     try:
         synced = await bot.tree.sync()
         logger.info(f"Synced {len(synced)} command(s)")
-    except Exception as e:
-        logger.error(f"Failed to sync commands: {e}")
-
-# UBAH: Periodic cleanup task
-@bot.event
-async def on_ready():
-    logger.info(f'Bot {bot.user} siap!')
-    try:
-        synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} command(s)")
         
         # Start periodic cleanup
         bot.loop.create_task(periodic_cleanup())
+        # TAMBAH: Memulai task untuk memeriksa ketidakaktifan dan menampilkan tombol
+        bot.loop.create_task(check_inactivity())
     except Exception as e:
         logger.error(f"Failed to sync commands: {e}")
 
+# TAMBAH: Task untuk memeriksa ketidakaktifan dan menampilkan tombol
+async def check_inactivity():
+    """Memeriksa channel yang tidak aktif selama 30 detik dan menampilkan tombol interaktif"""
+    while True:
+        try:
+            await asyncio.sleep(5)  # Cek setiap 5 detik untuk efisiensi
+            current_time = time.time()
+            for channel_id in bot_state.channel_activity:
+                if bot_state.channel_activity.get(channel_id, False):  # Hanya cek channel aktif
+                    last_activity = bot_state.last_activity.get(channel_id, 0)
+                    if current_time - last_activity > INACTIVITY_TIMEOUT:
+                        if channel_id not in bot_state.last_button_message:
+                            channel = bot.get_channel(int(channel_id))
+                            if channel:
+                                view = InteractionButtons(channel_id)
+                                message = await channel.send(
+                                    "Bot tidak aktif selama 30 detik",
+                                    view=view
+                                )
+                                bot_state.last_button_message[channel_id] = message
+        except Exception as e:
+            logger.error(f"Error in check_inactivity: {e}")
+        await asyncio.sleep(5)
+
 async def periodic_cleanup():
-    """UBAH: Task pembersihan periodik untuk menghemat memori"""
+    """Task pembersihan periodik untuk menghemat memori"""
     while True:
         try:
             await asyncio.sleep(300)  # Cleanup setiap 5 menit
@@ -534,7 +570,6 @@ async def periodic_cleanup():
 
 @bot.tree.command(name="activate", description="Mengaktifkan bot di channel ini")
 async def activate(interaction: Interaction):
-    """UBAH: Menggunakan helper function untuk cooldown check"""
     user_id = str(interaction.user.id)
     channel_id = str(interaction.channel_id)
     
@@ -547,11 +582,19 @@ async def activate(interaction: Interaction):
         return
     
     bot_state.channel_activity[channel_id] = True
+    # TAMBAH: Memperbarui waktu aktivitas terakhir
+    bot_state.last_activity[channel_id] = time.time()
+    # TAMBAH: Menghapus pesan tombol jika ada
+    if channel_id in bot_state.last_button_message:
+        try:
+            await bot_state.last_button_message[channel_id].delete()
+            del bot_state.last_button_message[channel_id]
+        except Exception as e:
+            logger.error(f"Error deleting button message: {e}")
     await interaction.response.send_message("**Status**\nBot diaktifkan di channel ini!")
 
 @bot.tree.command(name="deactivate", description="Menonaktifkan bot di channel ini")
 async def deactivate(interaction: Interaction):
-    """UBAH: Menggunakan helper function untuk cooldown check"""
     user_id = str(interaction.user.id)
     channel_id = str(interaction.channel_id)
     
@@ -564,43 +607,17 @@ async def deactivate(interaction: Interaction):
         return
     
     bot_state.channel_activity[channel_id] = False
+    # TAMBAH: Menghapus waktu aktivitas terakhir dan pesan tombol
+    if channel_id in bot_state.last_activity:
+        del bot_state.last_activity[channel_id]
+    if channel_id in bot_state.last_button_message:
+        try:
+            await bot_state.last_button_message[channel_id].delete()
+            del bot_state.last_button_message[channel_id]
+        except Exception as e:
+            logger.error(f"Error deleting button message: {e}")
     await interaction.response.send_message("**Status**\nBot dinonaktifkan di channel ini!")
 
-@bot.tree.command(name="pendek", description="Mengaktifkan mode jawaban singkat")
-async def pendek(interaction: Interaction):
-    """UBAH: Menggunakan helper function untuk cooldown check"""
-    user_id = str(interaction.user.id)
-    channel_id = str(interaction.channel_id)
-    
-    on_cooldown, remaining_time = check_cooldown(user_id, "pendek")
-    if on_cooldown:
-        await interaction.response.send_message(
-            f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik sebelum menggunakan perintah ini lagi.",
-            ephemeral=True
-        )
-        return
-    
-    bot_state.response_mode[channel_id] = 'pendek'
-    await interaction.response.send_message("**Status**\nMode respons pendek telah diaktifkan di channel ini!")
-
-@bot.tree.command(name="panjang", description="Mengaktifkan mode jawaban panjang")
-async def panjang(interaction: Interaction):
-    """UBAH: Menggunakan helper function untuk cooldown check"""
-    user_id = str(interaction.user.id)
-    channel_id = str(interaction.channel_id)
-    
-    on_cooldown, remaining_time = check_cooldown(user_id, "panjang")
-    if on_cooldown:
-        await interaction.response.send_message(
-            f"**Cooldown**\nSilakan tunggu {remaining_time:.1f} detik sebelum menggunakan perintah ini lagi.",
-            ephemeral=True
-        )
-        return
-    
-    bot_state.response_mode[channel_id] = 'panjang'
-    await interaction.response.send_message("**Status**\nMode respons panjang telah diaktifkan di channel ini!")
-
-# UBAH: Helper function untuk download file
 async def download_attachment(attachment: Attachment) -> Optional[bytes]:
     """Download attachment dengan error handling yang baik"""
     try:
@@ -625,15 +642,24 @@ async def on_message(message):
     is_bot_active = bot_state.channel_activity.get(channel_id, False)
     content = message.content.strip()
 
-    # UBAH: Menambahkan rate limiting per user
+    # Rate limiting per user
     user_id = str(message.author.id)
     current_time = time.time()
     user_last_message = bot_state.command_cooldowns.get(f"{user_id}-message", 0)
     
-    if current_time - user_last_message < 2:  # 2 detik antara pesan
+    if current_time - user_last_message < 2:
         return
     
     bot_state.command_cooldowns[f"{user_id}-message"] = current_time
+    # TAMBAH: Memperbarui waktu aktivitas terakhir untuk channel
+    bot_state.last_activity[channel_id] = current_time
+    # TAMBAH: Menghapus pesan tombol jika ada
+    if channel_id in bot_state.last_button_message:
+        try:
+            await bot_state.last_button_message[channel_id].delete()
+            del bot_state.last_button_message[channel_id]
+        except Exception as e:
+            logger.error(f"Error deleting button message: {e}")
 
     if content.lower() == '!reset':
         if channel_id in bot_state.conversation_history:
@@ -651,7 +677,6 @@ async def on_message(message):
             await message.channel.send('ℹ️ Tidak ada riwayat gambar yang perlu dihapus')
         return
 
-    # UBAH: Improved image generation commands
     if content.lower().startswith('!gambar'):
         async with message.channel.typing():
             image_prompt = content.replace('!gambar', '', 1).strip()
@@ -708,7 +733,6 @@ async def on_message(message):
                     await message.reply('**Error**\nHanya file gambar yang dapat diedit!')
                     return
                 
-                # UBAH: Menggunakan helper function untuk download
                 image_data = await download_attachment(attachment)
                 if image_data is None:
                     await message.reply('**Error**\nGagal mengunduh gambar atau file terlalu besar (maksimal 25MB)!')
@@ -748,7 +772,6 @@ async def on_message(message):
                     await message.reply('**Error**\nOnly image files can be edited!')
                     return
                 
-                # UBAH: Menggunakan helper function untuk download
                 image_data = await download_attachment(attachment)
                 if image_data is None:
                     await message.reply('**Error**\nFailed to download image or file too large (max 25MB)!')
@@ -796,7 +819,6 @@ async def on_message(message):
                     await message.reply(f'**Error**\nFormat file tidak didukung.\n**Format yang didukung:** {supported_formats}')
                     return
 
-                # UBAH: Menggunakan helper function untuk download
                 file_data = await download_attachment(attachment)
                 if file_data is None:
                     await message.reply('**Error**\nGagal mengunduh file atau file terlalu besar (maksimal 25MB)!')
@@ -811,7 +833,6 @@ async def on_message(message):
                 
                 for i, chunk in enumerate(response_chunks):
                     await message.channel.send(chunk)
-                    # UBAH: Delay yang lebih pendek untuk chunks
                     if i < len(response_chunks) - 1:
                         await asyncio.sleep(0.5)
             except Exception as e:
@@ -833,7 +854,6 @@ async def on_message(message):
                 
                 for i, chunk in enumerate(response_chunks):
                     await message.channel.send(chunk)
-                    # UBAH: Delay yang lebih pendek untuk chunks
                     if i < len(response_chunks) - 1:
                         await asyncio.sleep(0.5)
             except Exception as e:
@@ -841,7 +861,6 @@ async def on_message(message):
                 await message.channel.send("**Error**\nTerjadi kesalahan saat memproses permintaan.")
         return
 
-    # UBAH: Main chat logic dengan error handling yang lebih baik
     if is_bot_active or content.startswith('!chat') or content.startswith('!cari'):
         prompt = content
         search_query = None
@@ -862,11 +881,6 @@ async def on_message(message):
         elif is_bot_active and not content.startswith('!'):
             prompt = content
 
-        # UBAH: Menyesuaikan prompt berdasarkan mode respons dengan validasi
-        mode = bot_state.response_mode.get(channel_id, 'panjang')
-        if mode == 'pendek':
-            prompt = "Berikan jawaban yang singkat dan padat: " + prompt
-
         attachment = message.attachments[0] if message.attachments else None
         media_data = None
 
@@ -878,7 +892,6 @@ async def on_message(message):
                 return
 
             async with message.channel.typing():
-                # UBAH: Menggunakan helper function untuk download
                 file_data = await download_attachment(attachment)
                 if file_data is None:
                     await message.reply('**Error**\nGagal mengunduh file atau file terlalu besar (maksimal 25MB)!')
@@ -893,7 +906,6 @@ async def on_message(message):
                     
                     for i, chunk in enumerate(response_chunks):
                         await message.channel.send(chunk)
-                        # UBAH: Delay yang lebih pendek untuk chunks
                         if i < len(response_chunks) - 1:
                             await asyncio.sleep(0.5)
                 except Exception as e:
@@ -907,7 +919,6 @@ async def on_message(message):
                     
                     for i, chunk in enumerate(response_chunks):
                         await message.channel.send(chunk)
-                        # UBAH: Delay yang lebih pendek untuk chunks
                         if i < len(response_chunks) - 1:
                             await asyncio.sleep(0.5)
                 except Exception as e:
@@ -916,7 +927,6 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-# UBAH: Graceful shutdown handler
 @bot.event
 async def on_disconnect():
     global http_session
@@ -924,12 +934,10 @@ async def on_disconnect():
         await http_session.close()
     logger.info("Bot disconnected and cleaned up resources")
 
-# UBAH: Error handler untuk unhandled exceptions
 @bot.event
 async def on_error(event, *args, **kwargs):
     logger.error(f'Unhandled error in {event}: {args}, {kwargs}', exc_info=True)
 
-# UBAH: Command error handler
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
@@ -948,6 +956,5 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
     finally:
-        # UBAH: Cleanup on exit
         if http_session and not http_session.closed:
             asyncio.run(http_session.close())
